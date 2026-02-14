@@ -6,6 +6,8 @@
     <title>Gestión de Almacén Pro</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <!-- Librería para leer archivos Excel (.xlsx) -->
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; }
@@ -32,9 +34,9 @@
                 
                 <div class="flex items-center gap-3">
                     <label class="bg-indigo-600 hover:bg-indigo-500 transition-all px-5 py-2.5 rounded-xl cursor-pointer flex items-center gap-2 font-medium shadow-sm active:scale-95">
-                        <i class="fas fa-file-import"></i>
-                        <span>Importar CSV</span>
-                        <input type="file" id="csv-upload" accept=".csv" class="hidden">
+                        <i class="fas fa-file-excel"></i>
+                        <span>Importar Excel (.xlsx)</span>
+                        <input type="file" id="excel-upload" accept=".xlsx, .xls" class="hidden">
                     </label>
                 </div>
             </div>
@@ -87,7 +89,7 @@
                 <div id="empty-state" class="hidden py-20 flex flex-col items-center justify-center text-slate-400">
                     <i class="fas fa-database text-5xl mb-4 opacity-20"></i>
                     <p class="text-lg font-medium">No se encontraron productos</p>
-                    <p class="text-sm">Prueba con otro término o importa un archivo CSV</p>
+                    <p class="text-sm">Prueba con otro término o importa un archivo de Excel</p>
                 </div>
             </div>
         </main>
@@ -97,7 +99,7 @@
             <div class="max-w-7xl mx-auto px-4 flex flex-col md:flex-row justify-between items-center gap-4 text-sm text-slate-500">
                 <div class="flex items-center gap-2">
                     <span class="inline-block w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                    Conectado a la base de datos en tiempo real
+                    Conectado a Firestore (Persistencia en la nube)
                 </div>
                 <div id="user-info">Cargando identidad...</div>
             </div>
@@ -112,7 +114,7 @@
 
         // CONFIGURACIÓN DE ENTORNO
         const firebaseConfig = JSON.parse(__firebase_config);
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'almacen-default-id';
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'almacen-excel-v1';
         const initialToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
 
         // Inicialización
@@ -159,20 +161,18 @@
 
             emptyState.classList.add('hidden');
 
-            // 1. Renderizar Cabeceras (basadas en el primer objeto, omitiendo IDs internos)
             const keys = Object.keys(data[0]).filter(k => k !== 'id' && k !== 'updatedAt');
             headersRow.innerHTML = keys.map(key => `
                 <th class="px-6 py-4 text-xs font-bold text-slate-500 uppercase tracking-wider">
-                    ${key.replace(/_/g, ' ')}
+                    ${key.toUpperCase()}
                 </th>
             `).join('');
 
-            // 2. Renderizar Filas
             body.innerHTML = data.map(item => `
                 <tr class="hover:bg-indigo-50/50 transition-colors border-b border-slate-50 last:border-0">
                     ${keys.map(key => `
                         <td class="px-6 py-4 text-sm text-slate-700 whitespace-nowrap">
-                            ${item[key] || '-'}
+                            ${item[key] !== undefined && item[key] !== null ? item[key] : '-'}
                         </td>
                     `).join('')}
                 </tr>
@@ -181,7 +181,6 @@
 
         // --- LÓGICA DE NEGOCIO ---
 
-        // Autenticación (Regla 3)
         async function startAuth() {
             try {
                 if (initialToken) {
@@ -191,23 +190,20 @@
                 }
             } catch (err) {
                 console.error("Auth error:", err);
-                showStatus("Error de conexión. Reintenta más tarde.", "error");
+                showStatus("Error de conexión con la base de datos.", "error");
             }
         }
 
         onAuthStateChanged(auth, (user) => {
             if (user) {
                 currentUser = user;
-                document.getElementById('user-info').textContent = `ID Sesión: ${user.uid.substring(0, 12)}...`;
+                document.getElementById('user-info').textContent = `Usuario: ${user.uid.substring(0, 8)}`;
                 setupRealtimeListener();
             }
         });
 
-        // Listener de Firestore (Regla 1)
         function setupRealtimeListener() {
             if (!currentUser) return;
-
-            // Ruta: /artifacts/{appId}/public/data/inventory
             const inventoryCol = collection(db, 'artifacts', appId, 'public', 'data', 'inventory');
             
             onSnapshot(inventoryCol, (snapshot) => {
@@ -215,11 +211,10 @@
                 applyFilter();
             }, (error) => {
                 console.error("Snapshot error:", error);
-                showStatus("No tienes permisos para ver la base de datos.", "error");
+                showStatus("Error al sincronizar datos.", "error");
             });
         }
 
-        // Filtrado (Regla 2: Filtramos en memoria para evitar queries complejas)
         function applyFilter() {
             const term = document.getElementById('search-input').value.toLowerCase();
             const filtered = inventory.filter(item => {
@@ -230,52 +225,60 @@
             renderTable(filtered);
         }
 
-        // Carga de Archivo
-        document.getElementById('csv-upload').addEventListener('change', async (e) => {
+        // --- MANEJO DE EXCEL (.xlsx) ---
+        document.getElementById('excel-upload').addEventListener('change', async (e) => {
             const file = e.target.files[0];
             if (!file || !currentUser) return;
 
-            showStatus("Procesando archivo CSV...", "info");
+            showStatus("Leyendo archivo Excel...", "info");
             
             const reader = new FileReader();
             reader.onload = async (event) => {
                 try {
-                    const text = event.target.result;
-                    const rows = text.split(/\r?\n/).filter(line => line.trim() !== "");
-                    if (rows.length < 2) throw new Error("Archivo vacío");
+                    const data = new Uint8Array(event.target.result);
+                    const workbook = XLSX.read(data, { type: 'array' });
+                    
+                    // Tomamos la primera hoja del libro
+                    const firstSheetName = workbook.SheetNames[0];
+                    const worksheet = workbook.Sheets[firstSheetName];
+                    
+                    // Convertimos a JSON
+                    const jsonData = XLSX.utils.sheet_to_json(worksheet);
 
-                    const headers = rows[0].split(',').map(h => h.trim().toLowerCase());
-                    const dataRows = rows.slice(1);
+                    if (jsonData.length === 0) throw new Error("Archivo vacío");
 
-                    for (const rowText of dataRows) {
-                        const values = rowText.split(',');
-                        const item = {};
-                        headers.forEach((header, i) => {
-                            item[header] = values[i] ? values[i].trim() : "";
+                    showStatus(`Subiendo ${jsonData.length} registros a la base de datos...`, "info");
+
+                    for (const item of jsonData) {
+                        // Limpiamos los nombres de las propiedades (evitar espacios o puntos)
+                        const cleanedItem = {};
+                        Object.keys(item).forEach(key => {
+                            const cleanKey = key.trim().replace(/\./g, '_');
+                            cleanedItem[cleanKey] = item[key];
                         });
 
-                        // Buscamos un identificador único (codigo, id o similar)
-                        const docId = item.codigo || item.id || `item_${Math.random().toString(36).substr(2, 9)}`;
+                        // Identificador único: buscamos columnas comunes como "codigo" o "id"
+                        const docId = String(cleanedItem.codigo || cleanedItem.id || cleanedItem.Codigo || `item_${Math.random().toString(36).substr(2, 9)}`);
                         
-                        // Guardar en Firestore
+                        // Guardar en Firestore (Persistencia Real)
                         const docRef = doc(db, 'artifacts', appId, 'public', 'data', 'inventory', docId);
-                        await setDoc(docRef, { ...item, updatedAt: new Date().toISOString() });
+                        await setDoc(docRef, { 
+                            ...cleanedItem, 
+                            updatedAt: new Date().toISOString() 
+                        });
                     }
 
-                    showStatus("¡Inventario actualizado correctamente!", "success");
-                    e.target.value = ""; // Reset input
+                    showStatus("¡Base de datos actualizada correctamente!", "success");
+                    e.target.value = ""; 
                 } catch (err) {
-                    console.error("Upload error:", err);
-                    showStatus("Error al leer el archivo. Asegúrate que sea un CSV válido.", "error");
+                    console.error("Excel error:", err);
+                    showStatus("Error al procesar el Excel. Asegúrate que el formato sea correcto.", "error");
                 }
             };
-            reader.readAsText(file);
+            reader.readAsArrayBuffer(file);
         });
 
-        // Buscador
         document.getElementById('search-input').addEventListener('input', applyFilter);
-
-        // Inicio
         window.onload = startAuth;
 
     </script>
